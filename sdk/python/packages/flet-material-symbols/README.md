@@ -41,3 +41,11 @@ ft.Icon(
     optical_size=48,  # 20–48
 )
 ```
+
+## Updating icon data
+
+To regenerate the icon data after a `material_symbols_icons` package update, run from the `flet-material-symbols` directory:
+
+```
+uv run scripts/generate_icons.py
+```

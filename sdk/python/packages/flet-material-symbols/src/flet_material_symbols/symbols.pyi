@@ -1,11 +1,9 @@
 """
 Flet Material Symbols Icons Stub
 
-To generate/update this file run from the root of the repository:
+To generate/update this file run from the flet-material-symbols directory:
 
-```
-uv run .github/scripts/generate_icons.py
-```
+    uv run scripts/generate_icons.py
 """
 
 from flet.controls.icon_data import IconData
