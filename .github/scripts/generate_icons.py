@@ -105,6 +105,29 @@ def main():
         "../../sdk/python/packages/flet/src/flet/controls/cupertino/cupertino_icons.json",
     )
 
+    # material symbols icons
+    url = "https://raw.githubusercontent.com/timmaffett/material_symbols_icons/master/lib/symbols.dart"
+    set_id = 3
+    dart_content = download_dart_file(url)
+    icons = parse_dart_icons(dart_content, set_id)
+
+    generate_file(
+        icons,
+        "symbols_icons.dart",
+        "../../sdk/python/packages/flet-material-symbols/src/flutter/flet_material_symbols/lib/src/symbols_icons.dart",
+    )
+
+    generate_file(
+        icons,
+        "symbols.pyi",
+        "../../sdk/python/packages/flet-material-symbols/src/flet_material_symbols/symbols.pyi",
+    )
+
+    generate_json(
+        icons,
+        "../../sdk/python/packages/flet-material-symbols/src/flet_material_symbols/symbols.json",
+    )
+
 
 if __name__ == "__main__":
     main()
