@@ -619,6 +619,14 @@ class BaseBuildCommand(BaseFlutterCommand):
             "the repository with Flutter bootstrap template",
         )
         parser.add_argument(
+            "--no-optimize-icon-font",
+            dest="no_optimize_icon_font",
+            action="store_true",
+            default=False,
+            help="Disable icon font optimization (include all icons instead of only "
+            "those referenced in the app source code)",
+        )
+        parser.add_argument(
             "--show-platform-matrix",
             action="store_true",
             default=False,
@@ -1240,6 +1248,225 @@ class BaseBuildCommand(BaseFlutterCommand):
                 )
 
         self.save_yaml(self.pubspec_path, pubspec)
+
+    def optimize_icon_font(self):
+        """
+        Scan Python source files for referenced icons and generate an optimized
+        flet package override for the Flutter build to enable icon font tree-shaking.
+
+        By default all ~10,000 icons are bundled with every app.  This step
+        detects which icons are actually referenced in the Python sources,
+        creates a local copy of the installed ``flet`` Flutter package with
+        ``null`` placeholders in place of unused icons, and wires a
+        ``dependency_overrides`` entry into ``pubspec.yaml`` so that the
+        subsequent ``flutter build`` only compiles—and tree-shakes—the icons
+        your app actually uses.
+
+        The step is skipped when:
+        * ``--no-optimize-icon-font`` is passed on the CLI, or
+        * ``tool.flet.optimize.icon_font = false`` is set in ``pyproject.toml``.
+        """
+        import json
+        import re
+        from importlib import resources
+
+        assert self.options
+        assert self.python_app_path
+        assert self.build_dir
+        assert self.flutter_dir
+        assert self.get_pyproject
+        assert self.pubspec_path
+
+        # Respect opt-out flag / config
+        if self.options.no_optimize_icon_font or not self.get_bool_setting(
+            None, "optimize.icon_font", True
+        ):
+            return
+
+        self.update_status("[bold blue]Optimizing icon font...")
+
+        # ------------------------------------------------------------------
+        # Load icon name → packed-value mappings from the installed flet pkg
+        # ------------------------------------------------------------------
+        material_icons_json: dict[str, int] = json.loads(
+            resources.files("flet.controls.material")
+            .joinpath("icons.json")
+            .read_text(encoding="utf-8")
+        )
+        cupertino_icons_json: dict[str, int] = json.loads(
+            resources.files("flet.controls.cupertino")
+            .joinpath("cupertino_icons.json")
+            .read_text(encoding="utf-8")
+        )
+
+        # Build index → dart-name (lowercase) mappings
+        # set_id 1 = material, set_id 2 = cupertino
+        material_by_index: dict[int, str] = {}
+        for name_upper, packed in material_icons_json.items():
+            if ((packed >> 16) & 0xFF) == 1:
+                material_by_index[packed & 0xFFFF] = name_upper.lower()
+
+        cupertino_by_index: dict[int, str] = {}
+        for name_upper, packed in cupertino_icons_json.items():
+            if ((packed >> 16) & 0xFF) == 2:
+                cupertino_by_index[packed & 0xFFFF] = name_upper.lower()
+
+        material_names_set = set(material_by_index.values())
+        cupertino_names_set = set(cupertino_by_index.values())
+
+        # ------------------------------------------------------------------
+        # Scan Python sources for icon references
+        # ------------------------------------------------------------------
+        hash = HashStamp(self.build_dir / ".hash" / "icon_font")
+
+        used_material: set[str] = set()
+        used_cupertino: set[str] = set()
+
+        # Matches: ft.Icons.NAME  or  Icons.NAME  (uppercase identifiers)
+        material_re = re.compile(r"(?:ft\.)?Icons\.([A-Z][A-Z0-9_]*)")
+        # Matches: ft.CupertinoIcons.NAME  or  CupertinoIcons.NAME
+        cupertino_re = re.compile(r"(?:ft\.)?CupertinoIcons\.([A-Z][A-Z0-9_]*)")
+
+        for py_file in sorted(self.python_app_path.rglob("*.py")):
+            hash.update(str(py_file))
+            try:
+                content = py_file.read_text(encoding="utf-8", errors="ignore")
+                hash.update(content)
+                for m in material_re.finditer(content):
+                    name_lower = m.group(1).lower()
+                    if name_lower in material_names_set:
+                        used_material.add(name_lower)
+                for m in cupertino_re.finditer(content):
+                    name_lower = m.group(1).lower()
+                    if name_lower in cupertino_names_set:
+                        used_cupertino.add(name_lower)
+            except Exception:
+                pass
+
+        if not hash.has_changed():
+            console.log(
+                f"Icon font already optimized {self.emojis['checkmark']}"
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Locate the installed flet Flutter package
+        # ------------------------------------------------------------------
+        package_config_path = (
+            self.flutter_dir / ".dart_tool" / "package_config.json"
+        )
+        if not package_config_path.exists():
+            console.log(
+                "[yellow]Icon font optimization skipped: "
+                ".dart_tool/package_config.json not found"
+            )
+            return
+
+        with open(package_config_path, encoding="utf-8") as fh:
+            package_config = json.load(fh)
+
+        flet_package_root: Optional[Path] = None
+        for pkg in package_config.get("packages", []):
+            if pkg.get("name") == "flet":
+                root_uri: str = pkg.get("rootUri", "")
+                if root_uri.startswith("file://"):
+                    # Convert file URI to a local path (handles Windows drive letters)
+                    from urllib.parse import unquote
+                    from urllib.request import url2pathname
+
+                    flet_package_root = Path(url2pathname(unquote(root_uri[7:])))
+                elif root_uri.startswith("../") or root_uri.startswith("./"):
+                    # Relative URI – resolve against the package_config.json location
+                    flet_package_root = (
+                        package_config_path.parent / root_uri
+                    ).resolve()
+                else:
+                    flet_package_root = Path(root_uri)
+                break
+
+        if flet_package_root is None or not flet_package_root.exists():
+            console.log(
+                "[yellow]Icon font optimization skipped: "
+                "flet package not found in package_config.json"
+            )
+            return
+
+        # ------------------------------------------------------------------
+        # Create a patched local copy of the flet Flutter package
+        # ------------------------------------------------------------------
+        flet_optimized_dir = self.build_dir / "flet-optimized"
+        if flet_optimized_dir.exists():
+            shutil.rmtree(flet_optimized_dir)
+        shutil.copytree(flet_package_root, flet_optimized_dir)
+
+        def _write_icon_list(
+            dart_path: Path,
+            import_line: str,
+            list_name: str,
+            icon_prefix: str,
+            by_index: dict[int, str],
+            used: set[str],
+        ) -> None:
+            max_index = max(by_index) if by_index else 0
+            lines = [import_line, "", f"List<IconData?> {list_name} = ["]
+            for i in range(max_index + 1):
+                dart_name = by_index.get(i, "")
+                if dart_name and dart_name in used:
+                    lines.append(f"  {icon_prefix}.{dart_name},")
+                else:
+                    lines.append("  null,")
+            lines.append("];")
+            dart_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        utils_dir = flet_optimized_dir / "lib" / "src" / "utils"
+        _write_icon_list(
+            utils_dir / "material_icons.dart",
+            "import 'package:flutter/material.dart';",
+            "materialIcons",
+            "Icons",
+            material_by_index,
+            used_material,
+        )
+        _write_icon_list(
+            utils_dir / "cupertino_icons.dart",
+            "import 'package:flutter/cupertino.dart';",
+            "cupertinoIcons",
+            "CupertinoIcons",
+            cupertino_by_index,
+            used_cupertino,
+        )
+
+        # ------------------------------------------------------------------
+        # Wire the local override into pubspec.yaml
+        # ------------------------------------------------------------------
+        # The path in dependency_overrides is relative to the Flutter project root
+        try:
+            rel_path = flet_optimized_dir.relative_to(self.flutter_dir)
+            override_path = str(rel_path).replace(os.sep, "/")
+        except ValueError:
+            # flet_optimized_dir is not under flutter_dir; use absolute path
+            override_path = str(flet_optimized_dir).replace(os.sep, "/")
+
+        pubspec = self.load_yaml(self.pubspec_path)
+        if not pubspec.get("dependency_overrides"):
+            pubspec["dependency_overrides"] = {}
+        pubspec["dependency_overrides"]["flet"] = {"path": override_path}
+        self.save_yaml(self.pubspec_path, pubspec)
+
+        # ------------------------------------------------------------------
+        # Report
+        # ------------------------------------------------------------------
+        n_material = len(used_material)
+        n_cupertino = len(used_cupertino)
+        total_material = len(material_by_index)
+        total_cupertino = len(cupertino_by_index)
+        console.log(
+            f"Optimized icon font: "
+            f"{n_material}/{total_material} material icons, "
+            f"{n_cupertino}/{total_cupertino} cupertino icons "
+            f"{self.emojis['checkmark']}"
+        )
+        hash.commit()
 
     def customize_icons(self):
         """

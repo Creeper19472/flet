@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-List<IconData> materialIcons = [
+List<IconData?> materialIcons = [
   Icons.abc,
   Icons.abc_outlined,
   Icons.abc_rounded,
