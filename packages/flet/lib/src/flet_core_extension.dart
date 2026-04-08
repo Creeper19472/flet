@@ -440,9 +440,9 @@ class FletCoreExtension extends FletExtension {
     int iconIndex = iconCode & 0xFFFF;
 
     if (setId == 1) {
-      return materialIcons[iconIndex];
+      return iconIndex < materialIcons.length ? materialIcons[iconIndex] : null;
     } else if (setId == 2) {
-      return cupertinoIcons[iconIndex];
+      return iconIndex < cupertinoIcons.length ? cupertinoIcons[iconIndex] : null;
     } else {
       return null;
     }

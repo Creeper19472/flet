@@ -1,6 +1,6 @@
 import 'package:flutter/cupertino.dart';
 
-List<IconData> cupertinoIcons = [
+List<IconData?> cupertinoIcons = [
   CupertinoIcons.add,
   CupertinoIcons.add_circled,
   CupertinoIcons.add_circled_solid,
